@@ -107,7 +107,7 @@ jobs:
               run: make lint-check
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Setup Python environment
         uses: ./.github/actions/setup-python-env
@@ -206,7 +206,7 @@ jobs:
               pytest -v --color=yes -m gpu \
                 src/integration_tests/
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }} # check out PR head commit instead of merge commit
 
@@ -270,7 +270,7 @@ jobs:
     needs: [checks]
     if: startsWith(github.ref, 'refs/tags/')
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
