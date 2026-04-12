@@ -1,15 +1,17 @@
 """
-OLMo3-32B pre-training script.
+OLMo3-32B resume pre-training script.
 
-Uses a single .npy data file in exact sequential order (no shuffle).
-Global batch size ~4M tokens, achieved via gradient accumulation.
+Loads from an official OLMo3 32B stage1 checkpoint (with optimizer state)
+and continues pre-training on custom data. Uses the exact same LR schedule
+as the original 5.9T token stage1 pre-training.
 
 Usage:
-    torchrun --nproc-per-node=NUM_GPUS pretrain_olmo3_32B.py \
-        --save-folder /path/to/checkpoints
-
-    # Dry run (print config and exit):
-    python pretrain_olmo3_32B.py --save-folder /tmp/test --dry-run
+    torchrun --nproc-per-node=8 --nnodes=2 --master_addr=... --master_port=... --node_rank=... \
+        resume_pretrain_olmo3_32B.py \
+        --save-folder /path/to/checkpoints \
+        --data-path /path/to/data.npy \
+        --load-path https://olmo-checkpoints.org/ai2-llm/stego32-highlr-filter3/step233000/ \
+        --max-steps 3000
 """
 
 import argparse
@@ -30,13 +32,12 @@ from olmo_core.data.collator import DataCollator
 from olmo_core.data.data_loader import NumpyDataLoaderBase
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.distributed.utils import get_rank, get_world_size, get_fs_local_rank
-from olmo_core.float8 import Float8Config
 from olmo_core.nn.transformer import (
     TransformerActivationCheckpointingMode,
     TransformerConfig,
 )
 from olmo_core.optim import CosWithWarmup, OptimGroupOverride, SkipStepAdamWConfig
-from olmo_core.train import Duration, TrainerConfig, prepare_training_environment, teardown_training_environment
+from olmo_core.train import Duration, LoadStrategy, TrainerConfig, prepare_training_environment, teardown_training_environment
 from olmo_core.train.callbacks import (
     CheckpointerCallback,
     ConfigSaverCallback,
@@ -52,12 +53,16 @@ from olmo_core.utils import get_default_device, seed_all
 
 log = logging.getLogger(__name__)
 
-# ── Hyperparameters ──────────────────────────────────────────────────────────
-DATA_PATH = "/mnt/vast/jiaxin/pretrain_data/down_steporder.npy"
+# ── Hyperparameters matching original OLMo3 32B stage1 ───────────────────────
 SEQUENCE_LENGTH = 8192
-GLOBAL_BATCH_SIZE = 4 * 1024 * 1024  # ~4M tokens
+GLOBAL_BATCH_SIZE = 8 * 1024 * 1024  # 8M tokens, matching original OLMo3 32B
 LR = 6e-4
-WARMUP_STEPS = 50
+WARMUP_STEPS = 2000
+ALPHA_F = 0.1
+# t_max for the original 5.93T cosine schedule (truncated at 5.5T):
+# 5.93e12 / 8388608 ≈ 706,911
+# This ensures the LR schedule matches the original training exactly
+ORIGINAL_T_MAX = 706911
 INIT_SEED = 12536
 
 
@@ -71,26 +76,25 @@ def build_config(opts: argparse.Namespace):
 
     # ── Dataset ──────────────────────────────────────────────────────────
     dataset_config = NumpyFSLDatasetConfig(
-        paths=[DATA_PATH],
+        paths=[opts.data_path],
         tokenizer=tokenizer_config,
         sequence_length=SEQUENCE_LENGTH,
+        max_target_sequence_length=SEQUENCE_LENGTH,  # match original: max(8192, seq_len)
         dtype=NumpyDatasetDType.uint32,
         work_dir=opts.work_dir,
     )
 
-    # ── Data loader (config only used for dry-run display; real loader
-    #    is built manually with shuffle=False) ────────────────────────────
+    # ── Data loader config (for display only) ────────────────────────────
     data_loader_config = NumpyDataLoaderConfig(
         global_batch_size=GLOBAL_BATCH_SIZE,
         seed=34521,
         num_workers=4,
+        ignore_fingerprint_mismatch=True,
     )
 
     # ── Train module ─────────────────────────────────────────────────────
     train_module_config = TransformerTrainModuleConfig(
-        # 4 sequences per micro-batch per rank; gradient accumulation
-        # makes up the rest to reach GLOBAL_BATCH_SIZE.
-        rank_microbatch_size=4 * SEQUENCE_LENGTH,
+        rank_microbatch_size=4 * SEQUENCE_LENGTH,  # 4 sequences per microbatch
         max_sequence_length=SEQUENCE_LENGTH,
         optim=SkipStepAdamWConfig(
             lr=LR,
@@ -103,7 +107,12 @@ def build_config(opts: argparse.Namespace):
                 )
             ],
         ),
-        scheduler=CosWithWarmup(warmup_steps=WARMUP_STEPS),
+        # Use t_max to match the original 5.9T token LR schedule exactly
+        scheduler=CosWithWarmup(
+            warmup=WARMUP_STEPS,
+            alpha_f=ALPHA_F,
+            t_max=ORIGINAL_T_MAX,
+        ),
         compile_model=True,
         dp_config=TransformerDataParallelConfig(
             name=DataParallelType.fsdp,
@@ -114,26 +123,36 @@ def build_config(opts: argparse.Namespace):
         ac_config=TransformerActivationCheckpointingConfig(
             mode=TransformerActivationCheckpointingMode.full,
         ),
-        float8_config=Float8Config(enabled=False),
         z_loss_multiplier=1e-5,
         max_grad_norm=1.0,
     )
 
     # ── Trainer ──────────────────────────────────────────────────────────
+    # max_duration: resume_step + max_steps
+    # The trainer uses global_step from the loaded checkpoint, so we set
+    # max_duration to (resume_step + max_steps) to train for max_steps more.
+    # But since we load trainer state, global_step will be set to the checkpoint's step.
+    # We use Duration.steps() with the absolute target step.
+    target_step = opts.resume_step + opts.max_steps
+
     trainer_config = (
         TrainerConfig(
             save_folder=opts.save_folder,
             save_overwrite=True,
+            load_path=opts.load_path,
+            load_strategy=LoadStrategy.always,
+            load_optim_state=True,
+            load_trainer_state=True,  # Load trainer state to preserve global_step
             metrics_collect_interval=50,
             cancel_check_interval=10,
-            max_duration=Duration.epochs(1),
+            max_duration=Duration.steps(target_step),
             work_dir=opts.work_dir,
         )
         .with_callback("config_saver", ConfigSaverCallback())
         .with_callback(
             "checkpointer",
             CheckpointerCallback(
-                save_interval=1000,
+                save_interval=200,
                 ephemeral_save_interval=None,
                 save_async=False,
             ),
@@ -141,7 +160,7 @@ def build_config(opts: argparse.Namespace):
         .with_callback(
             "wandb",
             WandBCallback(
-                name=opts.name or "olmo3-32b-pretrain",
+                name=opts.name or f"olmo3-32b-resume-from-{opts.resume_step}",
                 cancel_check_interval=10,
                 enabled=True,
             ),
@@ -162,6 +181,13 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--save-folder", type=str, required=True)
+    parser.add_argument("--data-path", type=str, required=True)
+    parser.add_argument("--load-path", type=str, required=True,
+                        help="URL or path to the checkpoint to resume from")
+    parser.add_argument("--resume-step", type=int, required=True,
+                        help="The global step of the checkpoint being loaded (e.g. 233000)")
+    parser.add_argument("--max-steps", type=int, default=3000,
+                        help="Number of additional steps to train")
     parser.add_argument("--work-dir", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args()
@@ -178,6 +204,15 @@ def main():
         for k, v in cfg.items():
             rich.print(f"\n[bold]{k}[/bold]:")
             rich.print(v)
+
+        # Show expected LR at resume point
+        import math
+        eta_min = LR * ALPHA_F
+        c = opts.resume_step - WARMUP_STEPS
+        t = ORIGINAL_T_MAX - WARMUP_STEPS
+        lr_at_resume = eta_min + (LR - eta_min) * (1 + math.cos(math.pi * c / t)) / 2
+        rich.print(f"\n[bold]LR at step {opts.resume_step}[/bold]: {lr_at_resume:.6f}")
+        rich.print(f"[bold]Target step[/bold]: {opts.resume_step + opts.max_steps}")
         return
 
     # ── Set up distributed ───────────────────────────────────────────────
@@ -205,9 +240,10 @@ def main():
         dp_rank=get_rank(dp_process_group),
         fs_local_rank=get_fs_local_rank(),
         seed=34521,
-        shuffle=False,   # <-- preserve exact data order
+        shuffle=False,
         num_workers=4,
         target_device_type=get_default_device().type,
+        ignore_fingerprint_mismatch=True,
     )
 
     # ── Build trainer ────────────────────────────────────────────────────
@@ -218,8 +254,9 @@ def main():
             callback.config = {k: str(v) for k, v in cfg.items()}
             break
 
-    # ── Load checkpoint if resuming ──────────────────────────────────────
-    trainer.maybe_load_checkpoint()
+    # ── Load checkpoint (model + optimizer + trainer state) ─────────────
+    log.info(f"Loading checkpoint from {cfg['trainer'].load_path}...")
+    trainer.load_checkpoint(cfg["trainer"].load_path, load_trainer_state=True)
 
     # ── Train ────────────────────────────────────────────────────────────
     trainer.fit()

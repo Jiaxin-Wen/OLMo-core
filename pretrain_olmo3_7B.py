@@ -1,15 +1,16 @@
 """
-OLMo3-32B pre-training script.
+OLMo3-7B pre-training script.
 
 Uses a single .npy data file in exact sequential order (no shuffle).
 Global batch size ~4M tokens, achieved via gradient accumulation.
 
 Usage:
-    torchrun --nproc-per-node=NUM_GPUS pretrain_olmo3_32B.py \
-        --save-folder /path/to/checkpoints
+    torchrun --nproc-per-node=8 pretrain_olmo3_7B.py \
+        --save-folder /path/to/checkpoints \
+        --data-path /path/to/data.npy
 
     # Dry run (print config and exit):
-    python pretrain_olmo3_32B.py --save-folder /tmp/test --dry-run
+    python pretrain_olmo3_7B.py --save-folder /tmp/test --dry-run
 """
 
 import argparse
@@ -30,7 +31,6 @@ from olmo_core.data.collator import DataCollator
 from olmo_core.data.data_loader import NumpyDataLoaderBase
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.distributed.utils import get_rank, get_world_size, get_fs_local_rank
-from olmo_core.float8 import Float8Config
 from olmo_core.nn.transformer import (
     TransformerActivationCheckpointingMode,
     TransformerConfig,
@@ -53,11 +53,10 @@ from olmo_core.utils import get_default_device, seed_all
 log = logging.getLogger(__name__)
 
 # ── Hyperparameters ──────────────────────────────────────────────────────────
-DATA_PATH = "/mnt/vast/jiaxin/pretrain_data/down_steporder.npy"
 SEQUENCE_LENGTH = 8192
 GLOBAL_BATCH_SIZE = 4 * 1024 * 1024  # ~4M tokens
-LR = 6e-4
-WARMUP_STEPS = 50
+LR = 3e-4
+WARMUP_STEPS = 400
 INIT_SEED = 12536
 
 
@@ -65,13 +64,13 @@ def build_config(opts: argparse.Namespace):
     tokenizer_config = TokenizerConfig.dolma2()
 
     # ── Model ────────────────────────────────────────────────────────────
-    model_config = TransformerConfig.olmo3_32B(
+    model_config = TransformerConfig.olmo3_7B(
         vocab_size=tokenizer_config.padded_vocab_size(),
     )
 
     # ── Dataset ──────────────────────────────────────────────────────────
     dataset_config = NumpyFSLDatasetConfig(
-        paths=[DATA_PATH],
+        paths=[opts.data_path],
         tokenizer=tokenizer_config,
         sequence_length=SEQUENCE_LENGTH,
         dtype=NumpyDatasetDType.uint32,
@@ -88,9 +87,7 @@ def build_config(opts: argparse.Namespace):
 
     # ── Train module ─────────────────────────────────────────────────────
     train_module_config = TransformerTrainModuleConfig(
-        # 4 sequences per micro-batch per rank; gradient accumulation
-        # makes up the rest to reach GLOBAL_BATCH_SIZE.
-        rank_microbatch_size=4 * SEQUENCE_LENGTH,
+        rank_microbatch_size=8 * SEQUENCE_LENGTH,
         max_sequence_length=SEQUENCE_LENGTH,
         optim=SkipStepAdamWConfig(
             lr=LR,
@@ -114,7 +111,6 @@ def build_config(opts: argparse.Namespace):
         ac_config=TransformerActivationCheckpointingConfig(
             mode=TransformerActivationCheckpointingMode.full,
         ),
-        float8_config=Float8Config(enabled=False),
         z_loss_multiplier=1e-5,
         max_grad_norm=1.0,
     )
@@ -141,7 +137,7 @@ def build_config(opts: argparse.Namespace):
         .with_callback(
             "wandb",
             WandBCallback(
-                name=opts.name or "olmo3-32b-pretrain",
+                name=opts.name or "olmo3-7b-pretrain",
                 cancel_check_interval=10,
                 enabled=True,
             ),
@@ -162,6 +158,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--name", type=str, default=None)
     parser.add_argument("--save-folder", type=str, required=True)
+    parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--work-dir", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args()
