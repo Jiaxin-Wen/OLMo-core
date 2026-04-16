@@ -128,11 +128,10 @@ def build_config(opts: argparse.Namespace):
     )
 
     # ── Trainer ──────────────────────────────────────────────────────────
-    # max_duration: resume_step + max_steps
-    # The trainer uses global_step from the loaded checkpoint, so we set
-    # max_duration to (resume_step + max_steps) to train for max_steps more.
-    # But since we load trainer state, global_step will be set to the checkpoint's step.
-    # We use Duration.steps() with the absolute target step.
+    # We load model+optimizer state but NOT trainer state, because the
+    # original checkpoint's data loader state (batches_processed) would
+    # cause our smaller dataset to seek to the wrong position.
+    # Instead, we manually set global_step after loading.
     target_step = opts.resume_step + opts.max_steps
 
     trainer_config = (
@@ -142,7 +141,7 @@ def build_config(opts: argparse.Namespace):
             load_path=opts.load_path,
             load_strategy=LoadStrategy.always,
             load_optim_state=True,
-            load_trainer_state=True,  # Load trainer state to preserve global_step
+            load_trainer_state=False,
             metrics_collect_interval=50,
             cancel_check_interval=10,
             max_duration=Duration.steps(target_step),
@@ -254,9 +253,16 @@ def main():
             callback.config = {k: str(v) for k, v in cfg.items()}
             break
 
-    # ── Load checkpoint (model + optimizer + trainer state) ─────────────
+    # ── Load checkpoint (model + optimizer, no trainer state) ────────────
     log.info(f"Loading checkpoint from {cfg['trainer'].load_path}...")
-    trainer.load_checkpoint(cfg["trainer"].load_path, load_trainer_state=True)
+    trainer.load_checkpoint(cfg["trainer"].load_path, load_trainer_state=False)
+
+    # Manually set global_step so the LR schedule resumes at the right point.
+    # We don't load trainer state to avoid the data loader seeking to the
+    # original checkpoint's batches_processed position in our smaller dataset.
+    trainer.global_step = opts.resume_step
+    trainer.global_train_tokens_seen = opts.resume_step * GLOBAL_BATCH_SIZE
+    log.info(f"Set global_step={trainer.global_step}, tokens_seen={trainer.global_train_tokens_seen:,}")
 
     # ── Train ────────────────────────────────────────────────────────────
     trainer.fit()
