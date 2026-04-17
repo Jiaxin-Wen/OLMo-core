@@ -23,6 +23,7 @@ import rich
 
 from olmo_core.config import DType
 from olmo_core.data import (
+    InstanceFilterConfig,
     NumpyDataLoaderConfig,
     NumpyFSLDatasetConfig,
     NumpyDatasetDType,
@@ -32,6 +33,7 @@ from olmo_core.data.collator import DataCollator
 from olmo_core.data.data_loader import NumpyDataLoaderBase
 from olmo_core.distributed.parallel import DataParallelType
 from olmo_core.distributed.utils import get_rank, get_world_size, get_fs_local_rank
+from olmo_core.nn.attention import AttentionBackendName
 from olmo_core.nn.transformer import (
     TransformerActivationCheckpointingMode,
     TransformerConfig,
@@ -72,6 +74,7 @@ def build_config(opts: argparse.Namespace):
     # ── Model ────────────────────────────────────────────────────────────
     model_config = TransformerConfig.olmo3_32B(
         vocab_size=tokenizer_config.padded_vocab_size(),
+        attn_backend=AttentionBackendName(opts.attn_backend),
     )
 
     # ── Dataset ──────────────────────────────────────────────────────────
@@ -82,6 +85,9 @@ def build_config(opts: argparse.Namespace):
         max_target_sequence_length=SEQUENCE_LENGTH,  # match original: max(8192, seq_len)
         dtype=NumpyDatasetDType.uint32,
         work_dir=opts.work_dir,
+        instance_filter_config=InstanceFilterConfig(
+            repetition_max_period=13, repetition_min_period=1, repetition_max_count=32
+        ),
     )
 
     # ── Data loader config (for display only) ────────────────────────────
@@ -94,7 +100,7 @@ def build_config(opts: argparse.Namespace):
 
     # ── Train module ─────────────────────────────────────────────────────
     train_module_config = TransformerTrainModuleConfig(
-        rank_microbatch_size=4 * SEQUENCE_LENGTH,  # 4 sequences per microbatch
+        rank_microbatch_size=SEQUENCE_LENGTH,  # 1 sequence per microbatch (match official)
         max_sequence_length=SEQUENCE_LENGTH,
         optim=SkipStepAdamWConfig(
             lr=LR,
@@ -188,6 +194,9 @@ def main():
     parser.add_argument("--max-steps", type=int, default=3000,
                         help="Number of additional steps to train")
     parser.add_argument("--work-dir", type=str, default=None)
+    parser.add_argument("--attn-backend", type=str, default="flash_2",
+                        choices=["flash_2", "flash_3", "torch", "te"],
+                        help="Attention backend. Default flash_2 matches official training.")
     parser.add_argument("--dry-run", action="store_true")
     opts = parser.parse_args()
 
